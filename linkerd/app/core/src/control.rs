@@ -189,7 +189,7 @@ pub mod dns_resolve {
         }
 
         fn call(&mut self, target: ControlAddr) -> Self::Future {
-            futures::future::ok(resolve::from_stream::<UpdatesStream>(Box::pin(
+            future::ok(resolve::from_stream::<UpdatesStream>(Box::pin(
                 resolution_stream(self.dns.clone(), target.clone()),
             )))
         }

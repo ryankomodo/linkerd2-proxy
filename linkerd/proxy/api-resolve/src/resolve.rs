@@ -3,10 +3,12 @@ use crate::core::resolve::{self, Update};
 use crate::metadata::Metadata;
 use crate::pb;
 use api::destination_client::DestinationClient;
+use async_stream::try_stream;
+use futures::future;
+use futures::stream::StreamExt;
 use futures::Stream;
 use http_body::Body as HttpBody;
 use std::error::Error;
-use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tonic::{
@@ -16,9 +18,6 @@ use tonic::{
 };
 use tower::Service;
 use tracing::{debug, info, trace};
-use async_stream::try_stream;
-use futures::pin_mut;
-use futures::stream::StreamExt;
 
 #[derive(Clone)]
 pub struct Resolve<S> {
@@ -61,8 +60,8 @@ where
     }
 }
 
-
-type UpdatesStream =Pin<Box<dyn Stream<Item = Result<Update<Metadata>, grpc::Status>> + Send + 'static>>;
+type UpdatesStream =
+    Pin<Box<dyn Stream<Item = Result<Update<Metadata>, grpc::Status>> + Send + 'static>>;
 
 impl<T, S> Service<T> for Resolve<S>
 where
@@ -76,8 +75,7 @@ where
 {
     type Response = resolve::FromStream<UpdatesStream>;
     type Error = grpc::Status;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+    type Future = futures::future::Ready<Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // The future returned by the Tonic generated `DestinationClient`'s `get` method will drive the service to readiness before calling it, so we can always return `Ready` here.
@@ -87,28 +85,37 @@ where
     fn call(&mut self, target: T) -> Self::Future {
         let path = target.to_string();
         debug!(dst = %path, context = %self.context_token, "Resolving");
-        let mut svc = self.service.clone();
         let req = api::GetDestination {
             path,
             scheme: self.scheme.clone(),
             context_token: self.context_token.clone(),
         };
 
-        Box::pin(async move {
-            let rsp = svc.get(grpc::Request::new(req)).await?;
-            trace!(metadata = ?rsp.metadata());
-            Ok(resolve::from_stream::<UpdatesStream>(Box::pin(resolution(rsp.into_inner()))))
-        })
+        future::ok(resolve::from_stream::<UpdatesStream>(Box::pin(resolution(
+            self.service.clone(),
+            req,
+        ))))
     }
 }
 
-
-fn resolution<S: Stream<Item = Result<api::Update, grpc::Status>> + Send + Sync + 'static>(input: S)
-    -> impl Stream<Item = Result<resolve::Update<Metadata>,grpc::Status>>
+fn resolution<S>(
+    mut client: DestinationClient<S>,
+    req: api::GetDestination,
+) -> impl Stream<Item = Result<resolve::Update<Metadata>, grpc::Status>>
+where
+    S: GrpcService<BoxBody> + Clone + Send + 'static,
+    S::Error: Into<Box<dyn Error + Send + Sync>> + Send,
+    S::ResponseBody: Send,
+    <S::ResponseBody as Body>::Data: Send,
+    <S::ResponseBody as HttpBody>::Error: Into<Box<dyn Error + Send + Sync + 'static>> + Send,
+    S::Future: Send,
 {
     try_stream! {
-        pin_mut!(input);
-        while let Some(update) = input.next().await {
+        let rsp = client.get(grpc::Request::new(req)).await?;
+        trace!(metadata = ?rsp.metadata());
+        let mut stream = rsp.into_inner();
+
+        while let Some(update) = stream.next().await {
             match update?.update {
                 Some(api::update::Update::Add(api::WeightedAddrSet {
                     addrs,
